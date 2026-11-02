@@ -15,6 +15,7 @@ import {
   upgradeCost,
   type Choice,
   type Resolution,
+  type Settlement,
 } from './engine';
 import { Scene, sceneLabel } from './Scene';
 import { useColony, type ColonyModel } from './useColony';
@@ -77,14 +78,14 @@ function yieldText(m: Resolution['members'][number]): string {
 /* ---------------- round panel ---------------- */
 
 function RoundPanel({ model }: { model: ColonyModel }) {
-  const { currentRound, msLeft, choices, choose, coreError, status, statusError, storageOk, retry, settledThrough } = model;
+  const { currentRound, msLeft, choices, choose, coreError, status, statusError, storageOk, retry, replay, season } = model;
   const picked = currentRound ? choices[currentRound] : undefined;
+  const resolved = new Set(replay?.resolutions.map((r) => r.settlement.toRound));
+  const range = season ? seasonRange(season) : null;
   const pending = Object.keys(choices)
     .map(Number)
-    .filter((r) => settledThrough === null || r > settledThrough)
-    .filter((r) => r !== currentRound)
-    .sort((a, b) => b - a)
-    .slice(0, 3);
+    .filter((r) => range && r >= range.first && r <= range.last && r !== currentRound && !resolved.has(r))
+    .sort((a, b) => b - a);
 
   if (coreError && currentRound === null) {
     return (
@@ -101,14 +102,14 @@ function RoundPanel({ model }: { model: ColonyModel }) {
     );
   }
 
-  const wheelText =
-    status === null
-      ? statusError
-        ? 'Wheel status unknown'
-        : 'Checking the wheel'
-      : status.freshness === 'stale'
-        ? 'Wheel sensor is quiet'
-        : status.coreStatus === 'ACTIVE'
+  const unavailable = Boolean(statusError) || (status !== null && status.freshness !== 'online');
+  const wheelText = unavailable
+    ? status
+      ? 'Wheel status unavailable. Showing the last reading.'
+      : 'Wheel status unavailable. Retrying every 10 seconds.'
+    : status === null
+      ? 'Checking the wheel'
+      : status.coreStatus === 'ACTIVE'
           ? `Wheel turning${status.rpm !== null ? ` at ${status.rpm} rpm` : ''}`
           : status.coreStatus === 'IDLE'
             ? 'Wheel idle'
@@ -130,13 +131,21 @@ function RoundPanel({ model }: { model: ColonyModel }) {
           )}
         </p>
       </div>
-      <p className="live-line">
-        <span className={`dot ${status?.coreStatus === 'ACTIVE' && status.freshness === 'online' ? 'dot-on' : ''}`} aria-hidden="true" />
+      <p className="live-line" role={unavailable ? 'alert' : undefined}>
+        <span className={`dot ${!unavailable && status?.coreStatus === 'ACTIVE' ? 'dot-on' : ''}`} aria-hidden="true" />
         {wheelText}
-        {status?.openRoundPasses !== null && status?.openRoundPasses !== undefined && (
+        {!unavailable && status?.openRoundPasses !== null && status?.openRoundPasses !== undefined && (
           <span className="muted"> · {passesText(status.openRoundPasses)} so far, unofficial</span>
         )}
       </p>
+      {unavailable && status && (
+        <p className="note">
+          Last reading: <time dateTime={status.generatedAt}>{status.generatedAt}</time>
+          {status.rpm !== null ? ` · ${status.rpm} rpm` : ''}
+          {status.openRoundPasses !== null ? ` · ${passesText(status.openRoundPasses)}, unofficial` : ''}.
+          Retrying every 10 seconds.
+        </p>
+      )}
 
       <fieldset className="choices" disabled={!currentRound || Boolean(picked)}>
         <legend>{picked ? 'Your choice is locked in' : 'Pick one free move for this round'}</legend>
@@ -162,12 +171,13 @@ function RoundPanel({ model }: { model: ColonyModel }) {
       </p>
       {!storageOk && <p className="error">This browser blocked storage, so your choice lasts only while this tab is open.</p>}
       {pending.length > 0 && (
-        <ul className="pending" aria-label="Choices waiting for settlement">
-          {pending.map((r) => (
+        <ul className="pending" aria-label="Choices waiting for resolution">
+          {pending.slice(0, 3).map((r) => (
             <li key={r}>
-              Round {r}: {CHOICE_LABEL[choices[r]]}, waiting for settlement
+              Round {r}: {CHOICE_LABEL[choices[r]]}, waiting for round resolution
             </li>
           ))}
+          {pending.length > 3 && <li>{pending.length - 3} more saved moves waiting for results.</li>}
         </ul>
       )}
     </section>
@@ -183,7 +193,7 @@ function LatestResult({ model }: { model: ColonyModel }) {
   return (
     <section className="latest" aria-labelledby="latest-title">
       <h2 id="latest-title" className="h-small">
-        Last settlement
+        Last resolved round
       </h2>
       <p>
         {roundsLabel(latest)} settled as <KindTag kind={latest.kind} /> with {passesText(latest.settlement.passes)}.{' '}
@@ -304,6 +314,12 @@ function HistoryRow({ r }: { r: Resolution }) {
           Official feed
         </a>
       </p>
+      {r.sourceSettlement && (
+        <p className="note">
+          The official settlement certifies zero work across rounds {r.sourceSettlement.fromRound} to {r.sourceSettlement.toRound}.
+          This round is resolved individually as a Nap.
+        </p>
+      )}
       <details>
         <summary>Seed and crew</summary>
         <p>
@@ -342,14 +358,49 @@ function HistoryRow({ r }: { r: Resolution }) {
   );
 }
 
+function DeferredHistoryRow({ settlement: s, choices }: { settlement: Settlement; choices: Record<number, Choice> }) {
+  const saved = Object.keys(choices).map(Number).filter((r) => r >= s.fromRound && r <= s.toRound).sort((a, b) => a - b);
+  const batch = s.fromRound !== s.toRound;
+  return (
+    <li className="history-row" id={`round-${s.toRound}`}>
+      <h3>{batch ? `Rounds ${s.fromRound} to ${s.toRound}` : `Round ${s.toRound}`}</h3>
+      <p>
+        {batch && (s.passes !== 0 || s.activeRounds !== 0)
+          ? `Official batch total: ${passesText(s.passes)}. Individual round results are unknown.`
+          : `Official result: ${passesText(s.passes)}. Colony replay is waiting on an earlier batch.`}{' '}
+        No yields or points have been applied. Saved moves remain pending.
+      </p>
+      {saved.length > 0 && (
+        <ul className="pending">
+          {saved.map((round) => <li key={round}>Round {round}: {CHOICE_LABEL[choices[round]]}, saved and unresolved</li>)}
+        </ul>
+      )}
+      <p className="links">
+        <a href={`${EXPLORER_TX}${s.txHash}`} target="_blank" rel="noreferrer">Settlement transaction</a>
+        <a href={SETTLEMENTS_URL} target="_blank" rel="noreferrer">Official feed</a>
+      </p>
+    </li>
+  );
+}
+
 function History({ model }: { model: ColonyModel }) {
   const [shown, setShown] = useState(10);
   const resolutions = model.replay?.resolutions ?? [];
-  const newestFirst = useMemo(() => [...resolutions].reverse(), [resolutions]);
+  const deferred = model.replay?.deferred ?? [];
+  const newestFirst = useMemo(() => [
+    ...resolutions.map((r) => ({ round: r.settlement.toRound, resolution: r, settlement: r.settlement })),
+    ...deferred.map((s) => ({ round: s.toRound, resolution: null, settlement: s })),
+  ].sort((a, b) => b.round - a.round), [resolutions, deferred]);
   const range = model.season ? seasonRange(model.season) : null;
   return (
     <section id="history" className="section" aria-labelledby="history-title">
       <h2 id="history-title">Round history</h2>
+      {deferred.length > 0 && (
+        <p className="notice" role="status">
+          Colony replay is paused at rounds {deferred[0].fromRound} to {deferred[0].toRound} until official individual results are available.
+          Later rounds wait to preserve the colony&apos;s replay order.
+        </p>
+      )}
       {newestFirst.length === 0 ? (
         <p className="empty">
           {model.feedState === 'loading'
@@ -361,11 +412,14 @@ function History({ model }: { model: ColonyModel }) {
       ) : (
         <>
           <p className="muted">
-            {newestFirst.length} settlements this season{range ? `, rounds ${range.first} to ${range.last}` : ''}.
+            {resolutions.length} resolved rounds this season{range ? `, rounds ${range.first} to ${range.last}` : ''}.
+            {deferred.length > 0 ? ` ${deferred.length} settlements awaiting replay.` : ''}
           </p>
           <ol className="history">
-            {newestFirst.slice(0, shown).map((r) => (
-              <HistoryRow key={r.settlement.toRound} r={r} />
+            {newestFirst.slice(0, shown).map((entry) => (
+              entry.resolution
+                ? <HistoryRow key={entry.round} r={entry.resolution} />
+                : <DeferredHistoryRow key={entry.round} settlement={entry.settlement} choices={model.choices} />
             ))}
           </ol>
           {shown < newestFirst.length && (
@@ -396,7 +450,7 @@ function Leaderboard({ model }: { model: ColonyModel }) {
       <h2 id="board-title">Season {st.season} leaderboard</h2>
       <p className="muted">
         Seven neighbour burrows play every round with moves seeded from the round ID. You are the only real player on this device, and
-        you have played {st.played[YOU_ID] ?? 0} of {model.replay?.resolutions.length ?? 0} settlements. Favoured counts moves that matched
+        you have played {st.played[YOU_ID] ?? 0} of {model.replay?.resolutions.length ?? 0} resolved rounds. Favoured counts moves that matched
         the result&apos;s bonus.
       </p>
       <div className="table-wrap">
@@ -438,13 +492,13 @@ function Leaderboard({ model }: { model: ColonyModel }) {
 
 function Verify({ model }: { model: ColonyModel }) {
   const [value, setValue] = useState('');
-  const [result, setResult] = useState<{ ok: boolean; r?: Resolution; message?: string } | null>(null);
+  const [result, setResult] = useState<{ ok: boolean; r?: Resolution; message?: string; waiting?: Settlement } | null>(null);
   const resolutions = model.replay?.resolutions ?? [];
   const latestRound = resolutions.at(-1)?.settlement.toRound;
   const inputRef = useRef<HTMLInputElement>(null);
 
-  const fail = (message: string) => {
-    setResult({ ok: false, message });
+  const fail = (message: string, waiting?: Settlement) => {
+    setResult({ ok: false, message, waiting });
     inputRef.current?.focus();
   };
 
@@ -458,6 +512,11 @@ function Verify({ model }: { model: ColonyModel }) {
     const r = resolutions.find((x) => n >= x.settlement.fromRound && n <= x.settlement.toRound);
     if (r) {
       setResult({ ok: true, r });
+      return;
+    }
+    const waiting = model.replay?.deferred.find((s) => n >= s.fromRound && n <= s.toRound);
+    if (waiting) {
+      fail(`Round ${n} is settled, but its colony outcome is pending. Replay is waiting for official individual round results.`, waiting);
       return;
     }
     const range = model.season ? seasonRange(model.season) : null;
@@ -495,6 +554,11 @@ function Verify({ model }: { model: ColonyModel }) {
         {result && !result.ok && (
           <p id="verify-error" className="error">
             {result.message}
+          </p>
+        )}
+        {result?.waiting && (
+          <p className="links">
+            <a href={`${EXPLORER_TX}${result.waiting.txHash}`} target="_blank" rel="noreferrer">View the official settlement transaction</a>
           </p>
         )}
         {result?.ok && result.r && (
@@ -551,8 +615,9 @@ function HowItWorks() {
         <li>
           <h3>Anyone can replay it</h3>
           <p>
-            Each settlement is resolved with a seed made from its public round range and pass count. Same rounds, same choices, same
-            colony. Neighbour moves come from the round ID alone, so they are fixed before any result exists.
+            Each round is resolved with a seed made from its public round ID and pass count. Certified zero-work spans resolve as
+            individual Naps. Other batches wait for official individual results. Same rounds, same choices, same colony.
+            Neighbour moves come from the round ID alone, so they are fixed before any result exists.
           </p>
         </li>
       </ol>
@@ -572,8 +637,9 @@ export default function App() {
   const latest = model.replay?.resolutions.at(-1) ?? null;
   const levels = st?.levels ?? ROOMS.map(() => 1);
   const shields = st?.shields ?? ROOMS.map(() => 0);
-  const wheelActive = model.status?.coreStatus === 'ACTIVE' && model.status.freshness === 'online';
-  const wheelWord = model.status === null ? 'not yet known' : wheelActive ? 'turning' : 'still';
+  const wheelKnown = !model.statusError && model.status?.freshness === 'online';
+  const wheelActive = wheelKnown && model.status?.coreStatus === 'ACTIVE';
+  const wheelWord = !wheelKnown ? 'unknown' : wheelActive ? 'turning' : 'still';
 
   return (
     <>
@@ -608,7 +674,7 @@ export default function App() {
               shields={shields}
               latest={latest}
               wheelActive={wheelActive}
-              wheelKnown={model.status !== null}
+              wheelKnown={wheelKnown}
               label={sceneLabel(levels, shields, wheelWord, latest)}
             />
             {st && (

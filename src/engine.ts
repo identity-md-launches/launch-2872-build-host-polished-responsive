@@ -195,6 +195,8 @@ export interface RoomEvent {
 
 export interface Resolution {
   settlement: Settlement;
+  /** Original official event when a certified zero-work span was expanded. */
+  sourceSettlement?: Settlement;
   kind: Kind;
   seed: string;
   seedHash: number;
@@ -206,16 +208,14 @@ export interface Resolution {
   shieldsAfter: number[];
 }
 
-/** The player's choice that applies to a settlement: their latest pick inside its round range. */
+/** A choice can resolve only against its own individual round result. */
 export function choiceForSettlement(
   choices: Record<number, Choice>,
   s: Pick<Settlement, 'fromRound' | 'toRound'>,
 ): { round: number; choice: Choice } | null {
-  for (let r = s.toRound; r >= s.fromRound; r--) {
-    const c = choices[r];
-    if (c) return { round: r, choice: c };
-  }
-  return null;
+  if (s.fromRound !== s.toRound) return null;
+  const choice = choices[s.toRound];
+  return choice ? { round: s.toRound, choice } : null;
 }
 
 function cloneState(s: ColonyState): ColonyState {
@@ -243,6 +243,9 @@ export function resolveSettlement(
   settlement: Settlement,
   yourChoice: { round: number; choice: Choice } | null,
 ): { state: ColonyState; resolution: Resolution } {
+  if (settlement.fromRound !== settlement.toRound) {
+    throw new Error('Resolve individual rounds only; an official batch total is not a per-round result.');
+  }
   const state = cloneState(prev);
   state.shields = state.shields.map(() => 0);
   const kind = classify(settlement.passes);
@@ -366,26 +369,39 @@ export function resolveSettlement(
 }
 
 /**
- * Replay a season from its first round. Settlements outside the season are ignored;
- * a settlement that starts before the season but ends inside it belongs to the season.
+ * Replay individual rounds in season order. A certified zero-work span proves a Nap
+ * for each round; a positive batch does not reveal its per-round distribution.
+ * Pause at an unknown batch, retaining it and subsequent events for audit. Later
+ * rounds cannot update stores/rooms until the earlier colony state is known.
  */
 export function replaySeason(
   season: number,
   settlements: Settlement[],
   choices: Record<number, Choice>,
-): { state: ColonyState; resolutions: Resolution[] } {
+): { state: ColonyState; resolutions: Resolution[]; deferred: Settlement[] } {
   const { first, last } = seasonRange(season);
   const ordered = settlements
-    .filter((s) => s.toRound >= first && s.toRound <= last)
+    .filter((s) => s.toRound >= first && s.fromRound <= last)
     .sort((a, b) => a.toRound - b.toRound);
   let state = initialState(season);
   const resolutions: Resolution[] = [];
+  const deferred: Settlement[] = [];
   for (const s of ordered) {
-    const r = resolveSettlement(state, s, choiceForSettlement(choices, s));
-    state = r.state;
-    resolutions.push(r.resolution);
+    const batch = s.fromRound !== s.toRound;
+    if (deferred.length > 0 || (batch && (s.passes !== 0 || s.activeRounds !== 0))) {
+      deferred.push(s);
+      continue;
+    }
+    // Clip certified spans at both season boundaries before expanding them.
+    for (let round = Math.max(first, s.fromRound); round <= Math.min(last, s.toRound); round++) {
+      const individual = batch ? { ...s, fromRound: round, toRound: round } : s;
+      const r = resolveSettlement(state, individual, choiceForSettlement(choices, individual));
+      if (batch) r.resolution.sourceSettlement = s;
+      state = r.state;
+      resolutions.push(r.resolution);
+    }
   }
-  return { state, resolutions };
+  return { state, resolutions, deferred };
 }
 
 export function roundAt(timeMs: number, genesisSeconds: number): number {

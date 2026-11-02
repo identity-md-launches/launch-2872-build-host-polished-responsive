@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ApiError,
+  CHOICES_KEY,
   contiguousFrom,
   fetchCore,
   fetchSettlementPage,
@@ -36,15 +37,31 @@ export function useColony() {
   const [feedError, setFeedError] = useState<string | null>(null);
   const [choices, setChoices] = useState<Record<number, Choice>>(() => loadChoices());
   const [storageOk, setStorageOk] = useState(true);
-  const [clockOffset, setClockOffset] = useState(0);
-  const [now, setNow] = useState(() => Date.now());
+  // generatedAt timestamps content, not the current time. Anchor the browser's
+  // clock once, then advance with monotonic elapsed time independently of polls.
+  const [clock] = useState(() => ({ epoch: Date.now(), elapsed: performance.now() }));
+  const readClock = useCallback(() => clock.epoch + performance.now() - clock.elapsed, [clock]);
+  const [now, setNow] = useState(clock.epoch);
   const settlementsRef = useRef(settlements);
   settlementsRef.current = settlements;
+  const choicesRef = useRef(choices);
+  choicesRef.current = choices;
 
   // One-second tick for the countdown.
   useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
+    const t = setInterval(() => setNow(readClock()), 1000);
     return () => clearInterval(t);
+  }, [readClock]);
+
+  useEffect(() => {
+    const sync = (event: StorageEvent) => {
+      if (event.key !== CHOICES_KEY && event.key !== null) return;
+      const saved = loadChoices();
+      choicesRef.current = saved;
+      setChoices(saved);
+    };
+    window.addEventListener('storage', sync);
+    return () => window.removeEventListener('storage', sync);
   }, []);
 
   const loadCore = useCallback(async () => {
@@ -65,12 +82,8 @@ export function useColony() {
     let alive = true;
     const run = async () => {
       try {
-        const sentAt = Date.now();
         const s = await fetchStatus();
         if (!alive) return;
-        const receivedAt = Date.now();
-        const serverMs = Date.parse(s.generatedAt);
-        if (Number.isFinite(serverMs)) setClockOffset(serverMs - (sentAt + receivedAt) / 2);
         setStatus(s);
         setStatusError(null);
       } catch (e) {
@@ -85,8 +98,7 @@ export function useColony() {
     };
   }, []);
 
-  const serverNow = now + clockOffset;
-  const currentRound = core ? roundAt(serverNow, core.genesisSeconds) : null;
+  const currentRound = core ? roundAt(now, core.genesisSeconds) : null;
   const season = currentRound ? seasonOf(currentRound) : null;
   const seasonFirst = season ? seasonRange(season).first : null;
 
@@ -149,15 +161,27 @@ export function useColony() {
 
   const choose = useCallback(
     (choice: Choice) => {
-      if (currentRound === null) return;
-      setChoices((prev) => {
-        if (prev[currentRound]) return prev;
-        const next = { ...prev, [currentRound]: choice };
+      if (!core || currentRound === null) return;
+      const save = () => {
+        // Recheck after waiting for a lock: never save a move for an elapsed round.
+        const time = readClock();
+        if (roundAt(time, core.genesisSeconds) !== currentRound) {
+          setNow(time);
+          return;
+        }
+        // Read inside the lock. Persisted picks win over this tab's old snapshot.
+        const latest = { ...choicesRef.current, ...loadChoices() };
+        const next = latest[currentRound] ? latest : { ...latest, [currentRound]: choice };
         setStorageOk(saveChoices(next));
-        return next;
-      });
+        choicesRef.current = next;
+        setChoices(next);
+      };
+      // Serialize simultaneous tab clicks where supported; the synchronous
+      // read/merge fallback also protects a previously persisted choice.
+      if (navigator.locks) void navigator.locks.request(CHOICES_KEY, save).catch(save);
+      else save();
     },
-    [currentRound],
+    [core, currentRound, readClock],
   );
 
   const retry = useCallback(() => {
@@ -165,7 +189,7 @@ export function useColony() {
     if (seasonFirst !== null) void fullSync(seasonFirst);
   }, [core, loadCore, seasonFirst, fullSync]);
 
-  const msLeft = core && currentRound ? Math.max(0, roundEndsAt(currentRound, core.genesisSeconds) - serverNow) : null;
+  const msLeft = core && currentRound ? Math.max(0, roundEndsAt(currentRound, core.genesisSeconds) - now) : null;
 
   return {
     core,

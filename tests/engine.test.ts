@@ -77,8 +77,9 @@ describe('resolution', () => {
       expect(resolution.shieldsAfter[e.roomIndex]).toBe(0);
     }
   });
-  it('applies the latest choice inside a batched settlement', () => {
-    expect(choiceForSettlement({ 5: 'forage', 7: 'research' }, { fromRound: 4, toRound: 8 })).toEqual({ round: 7, choice: 'research' });
+  it('requires an individual round before selecting a choice', () => {
+    expect(choiceForSettlement({ 5: 'forage', 7: 'research' }, { fromRound: 4, toRound: 8 })).toBeNull();
+    expect(choiceForSettlement({ 5: 'forage', 7: 'research' }, { fromRound: 7, toRound: 7 })).toEqual({ round: 7, choice: 'research' });
     expect(choiceForSettlement({ 3: 'forage' }, { fromRound: 4, toRound: 8 })).toBeNull();
   });
   it('replays only settlements inside the season, in round order', () => {

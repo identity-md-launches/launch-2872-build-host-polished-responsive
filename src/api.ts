@@ -187,7 +187,7 @@ export async function syncSettlements(
 /* ---------- local storage ---------- */
 
 const CACHE_KEY = 'squeek-colony:settlements:v1';
-const CHOICES_KEY = 'squeek-colony:choices:v1';
+export const CHOICES_KEY = 'squeek-colony:choices:v1';
 
 export function loadCache(): Settlement[] {
   try {
